@@ -4,3 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+actix-web = "4.13.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+url = { version="2.5.8", features = ["serde"]}
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "fs"] }
+rand = "0.10.0"
+tera = "1.20.1"
+lazy_static = "1.5.0"
+actix-ws = "0.4.0"
+futures-util = "0.3.32"
