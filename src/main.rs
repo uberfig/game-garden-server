@@ -9,7 +9,7 @@ async fn main() -> std::io::Result<()> {
         .route("/rooms/reversi", web::get().to(reversi))
             .service(get_api_routes())
     })
-    .bind(("127.0.0.1", 8020))?
+    .bind(("127.0.0.1", 8021))?
     .run()
     .await
 }
