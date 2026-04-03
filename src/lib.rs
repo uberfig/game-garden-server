@@ -1,2 +1,2 @@
-pub mod routes;
 pub mod reversi;
+pub mod routes;
