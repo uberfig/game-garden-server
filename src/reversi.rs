@@ -1,8 +1,83 @@
-use actix_web::{Error, HttpRequest, HttpResponse, rt, web};
-use actix_ws::AggregatedMessage;
-use futures_util::StreamExt as _;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
-pub async fn reversi(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
+use actix_web::{
+    Error, HttpRequest, HttpResponse, get, rt,
+    web::{self, Data},
+};
+use actix_ws::AggregatedMessage;
+use futures_util::{StreamExt as _, lock::Mutex};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
+
+pub struct Lobbies {
+    /// queued up users for various games
+    pub queued: HashMap<String, Connection>,
+    pub next_id: AtomicU64,
+}
+
+impl Lobbies {
+    pub fn new() -> Self {
+        Self {
+            queued: HashMap::new(),
+            next_id: AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct LobbyWrapper {
+    pub lobbies: Arc<Mutex<Lobbies>>,
+}
+
+pub struct Connection {
+    pub id: u64,
+    pub to_client: Sender<String>,
+    pub from_client: Receiver<String>,
+}
+
+impl LobbyWrapper {
+    pub async fn get_or_queue(
+        &self,
+        stream: Connection,
+        game_name: String,
+    ) -> Option<(Connection, Connection)> {
+        let mut lock = self.lobbies.lock().await;
+        match lock.queued.remove(&game_name) {
+            Some(opponent) => {
+                println!("removing {}", game_name);
+                Some((opponent, stream))
+            },
+            None => {
+                println!("inserting {}", game_name);
+                lock.queued.insert(game_name, stream);
+                dbg!(&lock.queued.keys());
+                None
+            }
+        }
+    }
+    pub async fn get_id(&self) -> u64 {
+        let lock = self.lobbies.lock().await;
+        lock.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+    pub fn new() -> Self {
+        Self {
+            lobbies: Arc::new(Mutex::new(Lobbies::new())),
+        }
+    }
+}
+
+#[get("/rooms/{game}")]
+pub async fn game_matchmaking(
+    req: HttpRequest,
+    stream: web::Payload,
+    game_name: web::Path<String>,
+    lobbies: Data<LobbyWrapper>,
+) -> Result<HttpResponse, Error> {
     let (res, mut session, stream) = actix_ws::handle(&req, stream)?;
 
     let mut stream = stream
@@ -10,30 +85,87 @@ pub async fn reversi(req: HttpRequest, stream: web::Payload) -> Result<HttpRespo
         // aggregate continuation frames up to 1MiB
         .max_continuation_size(2_usize.pow(20));
 
+    let (to_client, mut to_client_receiver) = channel::<String>(100);
+    let (from_client, from_client_receiver) = channel::<String>(100);
+    let id = lobbies.get_id().await;
+
+    let conn = Connection {
+        id,
+        to_client,
+        from_client: from_client_receiver,
+    };
+
     // start task but don't wait for it
     rt::spawn(async move {
-        // receive messages from websocket
-        while let Some(msg) = stream.next().await {
-            match msg {
-                Ok(AggregatedMessage::Text(text)) => {
-                    // echo text message
-                    session.text(text).await.unwrap();
-                }
+        loop {
+            tokio::select! {
+                maybe_msg = stream.next() => {
+                match maybe_msg {
+                    Some(Ok(AggregatedMessage::Text(text))) => {
+                        let _ = from_client.send(text.to_string()).await;
 
-                Ok(AggregatedMessage::Binary(bin)) => {
-                    // echo binary message
-                    session.binary(bin).await.unwrap();
-                }
+                        // session.text(text).await.unwrap();
+                    }
 
-                Ok(AggregatedMessage::Ping(msg)) => {
-                    // respond to PING frame with PONG frame
-                    session.pong(&msg).await.unwrap();
-                }
+                    Some(Ok(AggregatedMessage::Binary(bin))) => {
+                        session.binary(bin).await.unwrap();
+                    }
 
-                _ => {}
+                    Some(Ok(AggregatedMessage::Ping(msg))) => {
+                        session.pong(&msg).await.unwrap();
+                    }
+
+                    Some(_) => {}
+
+                    None => break, // websocket closed
+                }
+            }
+
+            maybe_msg = to_client_receiver.recv() => {
+                match maybe_msg {
+                    Some(msg) => {
+                        session.text(msg).await.unwrap();
+                    }
+                    None => break, // sender dropped
+                }
+            }
+
             }
         }
     });
+
+    if let Some((mut player1, mut player2)) =
+        lobbies.get_or_queue(conn, game_name.into_inner()).await
+    {
+        println!("matchmade");
+        rt::spawn(async move {
+            player1.to_client.send("1".to_string()).await.unwrap();
+            player2.to_client.send("2".to_string()).await.unwrap();
+            loop {
+                tokio::select! {
+
+                maybe_msg = player1.from_client.recv() => {
+                    match maybe_msg {
+                        Some(msg) => {
+                            player2.to_client.send(msg).await.unwrap();
+                        }
+                        None => break, // sender dropped
+                    }
+                }
+
+                maybe_msg = player2.from_client.recv() => {
+                    match maybe_msg {
+                        Some(msg) => {
+                            player1.to_client.send(msg).await.unwrap();
+                        }
+                        None => break, // sender dropped
+                    }
+                }
+
+                }
+            }
+        });
+    }
 
     // respond immediately with response connected to WS session
     Ok(res)
