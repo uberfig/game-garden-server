@@ -20,14 +20,14 @@ use tokio::{
 
 pub struct Lobbies {
     /// queued up users for various games
-    pub queued: HashMap<String, Connection>,
+    pub queued: Mutex<HashMap<String, Connection>>,
     pub next_id: AtomicU64,
 }
 
 impl Lobbies {
     pub fn new() -> Self {
         Self {
-            queued: HashMap::new(),
+            queued: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
         }
     }
@@ -35,7 +35,7 @@ impl Lobbies {
 
 #[derive(Clone)]
 pub struct LobbyWrapper {
-    pub lobbies: Arc<Mutex<Lobbies>>,
+    pub lobbies: Arc<Lobbies>,
 }
 
 pub struct Connection {
@@ -50,39 +50,38 @@ impl LobbyWrapper {
         stream: Connection,
         game_name: String,
     ) -> Option<(Connection, Connection)> {
-        let mut lock = self.lobbies.lock().await;
-        match lock.queued.remove(&game_name) {
+        let mut lock = self.lobbies.queued.lock().await;
+        match lock.remove(&game_name) {
             Some(opponent) => {
                 println!("removing {}", game_name);
                 Some((opponent, stream))
             },
             None => {
                 println!("inserting {}", game_name);
-                lock.queued.insert(game_name, stream);
-                dbg!(&lock.queued.keys());
+                lock.insert(game_name, stream);
+                dbg!(&lock.keys());
                 None
             }
         }
     }
     pub async fn remove_if_queued(&self, con_id: u64, game_name: &String) {
-        let mut lock = self.lobbies.lock().await;
-        match lock.queued.get(game_name) {
+        let mut lock = self.lobbies.queued.lock().await;
+        match lock.get(game_name) {
             Some(c) => {
                 if c.id == con_id {
                     println!("{} disconnected before matched", game_name);
-                    lock.queued.remove(game_name);
+                    lock.remove(game_name);
                 }
             }
             None => {}
         }
     }
-    pub async fn get_id(&self) -> u64 {
-        let lock = self.lobbies.lock().await;
-        lock.next_id.fetch_add(1, Ordering::SeqCst)
+    pub fn get_id(&self) -> u64 {
+        self.lobbies.next_id.fetch_add(1, Ordering::SeqCst)
     }
     pub fn new() -> Self {
         Self {
-            lobbies: Arc::new(Mutex::new(Lobbies::new())),
+            lobbies: Arc::new(Lobbies::new()),
         }
     }
 }
@@ -103,7 +102,7 @@ pub async fn game_matchmaking(
 
     let (to_client, mut to_client_receiver) = channel::<String>(100);
     let (from_client, from_client_receiver) = channel::<String>(100);
-    let id = lobbies.get_id().await;
+    let id = lobbies.get_id();
 
     let conn = Connection {
         id,
