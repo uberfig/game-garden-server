@@ -11,7 +11,7 @@ use actix_web::{
     Error, HttpRequest, HttpResponse, get, rt,
     web::{self, Data},
 };
-use actix_ws::AggregatedMessage;
+use actix_ws::{AggregatedMessage, CloseCode, CloseReason};
 use futures_util::{StreamExt as _, lock::Mutex};
 use tokio::{
     sync::mpsc::{Receiver, Sender, channel},
@@ -64,6 +64,18 @@ impl LobbyWrapper {
             }
         }
     }
+    pub async fn remove_if_queued(&self, con_id: u64, game_name: &String) {
+        let mut lock = self.lobbies.lock().await;
+        match lock.queued.get(game_name) {
+            Some(c) => {
+                if c.id == con_id {
+                    println!("{} disconnected before matched", game_name);
+                    lock.queued.remove(game_name);
+                }
+            }
+            None => {}
+        }
+    }
     pub async fn get_id(&self) -> u64 {
         let lock = self.lobbies.lock().await;
         lock.next_id.fetch_add(1, Ordering::SeqCst)
@@ -99,6 +111,9 @@ pub async fn game_matchmaking(
         from_client: from_client_receiver,
     };
 
+    let lobbies2 = lobbies.clone();
+    let game_name2 = game_name.clone();
+
     // start task but don't wait for it
     rt::spawn(async move {
         let mut ping_timer = time::interval(Duration::from_secs(5));
@@ -127,7 +142,20 @@ pub async fn game_matchmaking(
                         session.pong(&msg).await.unwrap();
                     }
 
-                    Some(_) => {}
+                    Some(Ok(AggregatedMessage::Pong(_))) => {}
+
+                    Some(Ok(AggregatedMessage::Close(r))) => {
+                        // if let Some(ref rea) = r {
+                        //     println!("ws closed with {:?}", rea);
+                        // }
+                        lobbies2.remove_if_queued(id, &game_name2).await;
+                        session.close(r).await.unwrap();
+                        break;
+                    }
+
+                    Some(Err(err)) => {
+                        println!("ws error: {}", err);
+                    }
 
                     None => break, // websocket closed
                 }
@@ -138,7 +166,12 @@ pub async fn game_matchmaking(
                     Some(msg) => {
                         session.text(msg).await.unwrap();
                     }
-                    None => break, // sender dropped
+                    None => {
+                        session.close(Some(CloseReason::from(
+                            (CloseCode::Away, "Other player disconnected.")
+                        ))).await.unwrap();
+                        break;
+                    }, // sender dropped
                 }
             }
 
