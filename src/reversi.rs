@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use actix_web::{
@@ -12,7 +13,10 @@ use actix_web::{
 };
 use actix_ws::AggregatedMessage;
 use futures_util::{StreamExt as _, lock::Mutex};
-use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::{
+    sync::mpsc::{Receiver, Sender, channel},
+    time,
+};
 
 pub struct Lobbies {
     /// queued up users for various games
@@ -97,8 +101,16 @@ pub async fn game_matchmaking(
 
     // start task but don't wait for it
     rt::spawn(async move {
+        let mut ping_timer = time::interval(Duration::from_secs(5));
+        ping_timer.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
+                // send a ping packet every couple seconds so cloudflare doesn't kill it
+                _tick = ping_timer.tick() => {
+                    session.ping(b"").await.unwrap();
+                }
+
                 maybe_msg = stream.next() => {
                 match maybe_msg {
                     Some(Ok(AggregatedMessage::Text(text))) => {
