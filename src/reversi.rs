@@ -4,26 +4,30 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use actix_web::{
     Error, HttpRequest, HttpResponse, get, rt,
     web::{self, Data},
 };
-use actix_ws::AggregatedMessage;
+use actix_ws::{AggregatedMessage, CloseCode, CloseReason};
 use futures_util::{StreamExt as _, lock::Mutex};
-use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::{
+    sync::mpsc::{Receiver, Sender, channel},
+    time,
+};
 
 pub struct Lobbies {
     /// queued up users for various games
-    pub queued: HashMap<String, Connection>,
+    pub queued: Mutex<HashMap<String, Connection>>,
     pub next_id: AtomicU64,
 }
 
 impl Lobbies {
     pub fn new() -> Self {
         Self {
-            queued: HashMap::new(),
+            queued: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
         }
     }
@@ -31,7 +35,7 @@ impl Lobbies {
 
 #[derive(Clone)]
 pub struct LobbyWrapper {
-    pub lobbies: Arc<Mutex<Lobbies>>,
+    pub lobbies: Arc<Lobbies>,
 }
 
 pub struct Connection {
@@ -46,27 +50,38 @@ impl LobbyWrapper {
         stream: Connection,
         game_name: String,
     ) -> Option<(Connection, Connection)> {
-        let mut lock = self.lobbies.lock().await;
-        match lock.queued.remove(&game_name) {
+        let mut lock = self.lobbies.queued.lock().await;
+        match lock.remove(&game_name) {
             Some(opponent) => {
                 println!("removing {}", game_name);
                 Some((opponent, stream))
             },
             None => {
                 println!("inserting {}", game_name);
-                lock.queued.insert(game_name, stream);
-                dbg!(&lock.queued.keys());
+                lock.insert(game_name, stream);
+                dbg!(&lock.keys());
                 None
             }
         }
     }
-    pub async fn get_id(&self) -> u64 {
-        let lock = self.lobbies.lock().await;
-        lock.next_id.fetch_add(1, Ordering::SeqCst)
+    pub async fn remove_if_queued(&self, con_id: u64, game_name: &String) {
+        let mut lock = self.lobbies.queued.lock().await;
+        match lock.get(game_name) {
+            Some(c) => {
+                if c.id == con_id {
+                    println!("{} disconnected before matched", game_name);
+                    lock.remove(game_name);
+                }
+            }
+            None => {}
+        }
+    }
+    pub fn get_id(&self) -> u64 {
+        self.lobbies.next_id.fetch_add(1, Ordering::SeqCst)
     }
     pub fn new() -> Self {
         Self {
-            lobbies: Arc::new(Mutex::new(Lobbies::new())),
+            lobbies: Arc::new(Lobbies::new()),
         }
     }
 }
@@ -87,7 +102,7 @@ pub async fn game_matchmaking(
 
     let (to_client, mut to_client_receiver) = channel::<String>(100);
     let (from_client, from_client_receiver) = channel::<String>(100);
-    let id = lobbies.get_id().await;
+    let id = lobbies.get_id();
 
     let conn = Connection {
         id,
@@ -95,10 +110,21 @@ pub async fn game_matchmaking(
         from_client: from_client_receiver,
     };
 
+    let lobbies2 = lobbies.clone();
+    let game_name2 = game_name.clone();
+
     // start task but don't wait for it
     rt::spawn(async move {
+        let mut ping_timer = time::interval(Duration::from_secs(5));
+        ping_timer.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
+                // send a ping packet every couple seconds so cloudflare doesn't kill it
+                _tick = ping_timer.tick() => {
+                    session.ping(b"").await.unwrap();
+                }
+
                 maybe_msg = stream.next() => {
                 match maybe_msg {
                     Some(Ok(AggregatedMessage::Text(text))) => {
@@ -115,7 +141,20 @@ pub async fn game_matchmaking(
                         session.pong(&msg).await.unwrap();
                     }
 
-                    Some(_) => {}
+                    Some(Ok(AggregatedMessage::Pong(_))) => {}
+
+                    Some(Ok(AggregatedMessage::Close(r))) => {
+                        // if let Some(ref rea) = r {
+                        //     println!("ws closed with {:?}", rea);
+                        // }
+                        lobbies2.remove_if_queued(id, &game_name2).await;
+                        session.close(r).await.unwrap();
+                        break;
+                    }
+
+                    Some(Err(err)) => {
+                        println!("ws error: {}", err);
+                    }
 
                     None => break, // websocket closed
                 }
@@ -126,7 +165,12 @@ pub async fn game_matchmaking(
                     Some(msg) => {
                         session.text(msg).await.unwrap();
                     }
-                    None => break, // sender dropped
+                    None => {
+                        session.close(Some(CloseReason::from(
+                            (CloseCode::Away, "Other player disconnected.")
+                        ))).await.unwrap();
+                        break;
+                    }, // sender dropped
                 }
             }
 
